@@ -1,0 +1,377 @@
+---
+title: "January 6th Twitter Data Analysis"
+author: "Sage Fuentes"
+date: "2026-05-05"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+# global knitr options
+knitr::opts_chunk$set(echo = TRUE)
+# Load libraries
+library(tidyverse)
+library(dplyr)
+library(arrow)
+library(lubridate)
+library(tidytext)
+library(tidylo) # for log-odds
+library(textdata)
+library(stringr)
+library(scales) 
+library(stringr)
+library(tidyr)
+```
+
+## Data Cleaning
+
+```{r eval=FALSE, echo = TRUE}
+# Get a list of all CSV file paths in your folder
+files <- list.files(path = "./Data", 
+                    pattern = "*.csv", 
+                    full.names = TRUE)
+```
+
+```{r eval=FALSE, echo = TRUE}
+# 2. Read them all into one data frame
+# read_csv automatically binds them together into one tibble
+combinedData <- read_csv(files, id = "file_path")
+glimpse(combinedData)
+```
+ 
+```{r eval=FALSE, echo = TRUE}
+dateCleanedData <- combinedData %>% 
+    # Original data was PST, but is being read as UTC, force the timezone
+  mutate(time_col = force_tz(Date, tzone = "America/Los_Angeles")) %>%
+  # Now convert to EST
+  mutate(Date = with_tz(Date, tzone="America/New_York")) %>% 
+  # renaming to EST for 
+  rename(EST = Date)
+```
+
+Due to the original method of scraping this data being part of a larger project in which VADER and TextBlob scores were calculated for each tweet, the text available to us has been processed for this style of text evaluation. I am reanalyzing the text later due to improvements in technology since 2021, so the original VADER and TextBlob scores are not being included at this time to improve efficiency.
+
+```{r eval=FALSE, echo = TRUE}
+cleanSubsetData <- dateCleanedData %>%
+  # Want to keep just the relevant information
+  select(ProcessedText,
+       EST,
+       Outlinks,
+       ReplyCount,
+       RetweetCount,
+       LikeCount,
+       QuoteCount) %>% 
+  # want to remove duplicates that are from the same time and have the same content
+  distinct(ProcessedText, EST, .keep_all = TRUE) %>%
+  # Last step, cleaning the text again and making a column of hashtags for individual analysis
+  mutate(
+    # Extract hashtags into a list column
+    Hashtags = str_extract_all(ProcessedText, "#\\w+"),
+    # Create a 'clean' version for word-level analysis
+    TextClean = ProcessedText %>%
+      str_remove_all("http\\S+|www\\S+") %>% # Remove URLs
+      str_remove_all("@\\w+") %>%           # Remove Mentions
+      str_replace_all("[^[:alnum:][:space:]]", " ") %>% # Remove Emojis/Special chars
+      str_to_lower()
+  ) %>% 
+  # So I don't mix up text, making the old ProcessedText into 
+  rename(Text = ProcessedText)
+```
+
+
+```{r eval=FALSE, echo = TRUE}
+jan6onlyData <- cleanSubsetData %>% 
+  filter(between(EST, as.Date('2021-01-06'), as.Date('2021-01-07')))
+```
+
+
+
+```{r eval=FALSE, echo = TRUE}
+pqFullPath <- "./Data/capitolDataset"
+cleanSubsetData %>% 
+  write_dataset(path = pqPath, format = "parquet")
+pqJanPath <- "./Data/jan6Dataset"
+jan6onlyData %>% 
+  write_dataset(path = pqJanPath, format = "parquet")
+```
+
+## Analysis
+
+```{r}
+pqJanPath <- "./Data/jan6Dataset"
+capitolFullDF <- open_dataset(pqJanPath)
+```
+
+Trump
+holds sentiment meaning that obscures from the AFINN based sentiment analyses
+registers as a 'surprise' word in the nrc analysis
+
+
+```{r}
+# As there are some words in the analysis that might skew results, use tweetWords with anti_join in instances where that makes the most sense
+customStopWords <- tibble(
+  word = c("trump"
+           ),
+  lexicon = "custom"
+)
+```
+
+
+```{r}
+# Tokenize
+tweetWords <- capitolFullDF %>%
+  collect() %>% 
+  # Now run the tokenization
+  unnest_tokens(word, TextClean, drop = FALSE) %>%
+  # Remove stop words
+  anti_join(stop_words, by = "word")
+
+tweetOverallWordFreq <- tweetWords %>% 
+  count(word, sort = TRUE) %>% 
+  slice_max(n, n = 15)
+```
+
+
+```{r}
+# AFINN Sentiment Score per Word
+sentimentWords <- tweetWords %>%
+  select(EST, TextClean, word) %>% 
+  # removing 'trump'
+  anti_join(customStopWords, by = "word") %>% 
+  # Acquire sentiments
+  left_join(get_sentiments("afinn"), by = "word") %>%
+  # regroup
+  group_by(EST, TextClean) 
+
+sentimentSummary <- sentimentWords %>%
+  # Sum up the sentiment scores as per documentation
+  summarize(SentimentScore = sum(value, na.rm = TRUE), .groups = "drop")
+
+```
+
+```{r}
+# 1. Join with sentiments and categorize
+wordSentimentCategories <- sentimentWords %>%
+  ungroup() %>%
+  # Filter out words that didn't have an AFINN match
+  filter(!is.na(value)) %>%
+  mutate(category = ifelse(value > 0, "Positive", "Negative"))
+
+# 2. Get Top 10 words per category
+topWordsByCat <- wordSentimentCategories %>%
+  group_by(category, word) %>%
+  summarize(n = n(), .groups = "drop") %>%
+  group_by(category) %>%
+  slice_max(n, n = 10, with_ties = FALSE) %>%
+  ungroup()
+
+# Find the n of the top positive word
+top_pos_value <- topWordsByCat %>%
+  filter(category == "Positive") %>%
+  slice_max(n, n = 1) %>%
+  pull(n) %>%
+  format(big.mark = ",") # This adds the comma for readability
+```
+
+Due to one of the outliers in the positive words ("supporters" having ), I used `facet_wrap` with scales set to `free` to ensure legibility in both 
+
+```{r}
+# Comparison Bar Chart
+ggplot(topWordsByCat, aes(x = reorder_within(word, n, category), y = n, fill = category)) +
+  geom_col(show.legend = FALSE, alpha = 0.8) +
+  
+  # 1. Annotate with better positioning
+  geom_text(aes(label = format(n, big.mark = ",")), 
+            hjust = -0.1,            # Slightly closer to the bar
+            size = 3.5,              
+            fontface = "bold",       
+            color = "gray20") +      
+  
+  # 2. Allow labels to be drawn outside the panel (CRITICAL)
+  coord_flip(clip = "off") + 
+  
+  facet_wrap(~category, scales = "free") +
+  scale_x_reordered() + 
+  
+  # Named Colors
+  scale_fill_manual(values = c("Positive" = "seagreen4", "Negative" = "firebrick3")) +
+  
+  # 3. Increase expansion to 30% to accommodate large numbers/outliers
+  scale_y_continuous(expand = expansion(mult = c(0, 0.3))) +
+  
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    plot.subtitle = element_text(hjust = 0.5, size = 11, color = "gray30"),
+    panel.grid.major.y = element_blank(),
+    strip.text = element_text(face = "bold", size = 12),
+    # 4. Increase the right margin of the entire plot as a safety net
+    plot.margin = margin(10, 50, 10, 10) 
+  ) +
+  labs(
+    title = "Top 10 Most Prevalent Sentiment-Bearing Words",
+    subtitle = "Lexical prevalence within the AFINN sentiment dictionary",
+    x = NULL, 
+    y = "Total Frequency of Occurrences"
+  )
+```
+
+
+Add Trump as a stop word for this analysis, potentially others
+
+```{r}
+nrcEmotions <- tweetWords %>%
+  # removing 'trump'
+  anti_join(customStopWords, by = "word")%>% 
+  # join
+  inner_join(get_sentiments("nrc"), 
+             by = "word", 
+             relationship = "many-to-many") %>%
+  count(word, sentiment, sort = TRUE)
+
+# Visualizing emotion distribution
+# 1. Get the list of unique emotions
+emotion_list <- unique(nrcEmotions$sentiment)
+
+# 2. Loop through and print each plot
+for (emo in emotion_list) {
+  
+  # Filter data for the specific emotion
+  plot_data <- nrcEmotions %>%
+    filter(sentiment == emo) %>%
+    # limit to top 10
+    slice_max(n, n = 10)
+  
+  # Create the plot
+  p <- ggplot(plot_data, aes(x = n, y = reorder(word, n))) +
+    # Draw the bars
+    geom_col(aes(fill = n), show.legend = FALSE) + 
+    geom_text(aes(label = comma(n)), 
+              hjust = -0.1,          # Moves text slightly to the right of the bar
+              size = 4,              # Adjust text size
+              fontface = "bold") +
+    # Added a subtle gradient fill
+    scale_fill_viridis_c(option = "mako", begin = 0.3, end = 0.8) +
+    # Expand x-axis so the labels don't get cut off
+    scale_x_continuous(expand = expansion(mult = c(0, .15)), labels = comma) +
+    theme_minimal(base_size = 14) +
+    labs(
+      title = paste("Top Words Expressing:", str_to_title(emo)),
+      subtitle = paste("Top 10 words associated with", emo, "sentiment"),
+      x = "Total Occurrences",
+      y = NULL
+    ) +
+    theme(
+      # Centering the title and subtitle
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 18),
+      plot.subtitle = element_text(hjust = 0.5, size = 12, color = "gray30"),
+      panel.grid.major.y = element_blank(),
+      axis.text.y = element_text(face = "bold")
+    )
+
+  # In Rmd loops, you must explicitly print the plot
+  print(p)
+}
+```
+
+```{r}
+hashtagFull <- capitolFullDF %>%
+  select(EST, TextClean, Hashtags) %>% 
+  collect() %>% 
+  filter(!is.na(Hashtags)) %>%
+  # was dealing with compatibility errors with Arrow, so setting this as a vector
+  mutate(Hashtags = as.vector(Hashtags)) %>% 
+  # spliting each hashtag into individual rows removing the commas and spaces
+  separate_rows(Hashtags, sep = ",\\s*") %>% 
+  # normalizing casing
+  mutate(Hashtags = tolower(Hashtags)) 
+
+hashtagCounts <- hashtagFull %>% 
+  # aggregate counts and sort by frequency for later log odds analysis
+  count(Hashtags, sort = TRUE)
+
+# View the top 10
+head(hashtagCounts, 15)
+```
+
+```{r}
+# join the sentiments and hashtag data using EST and TextClean to join by 
+hashtagSentimentJoin <- hashtagFull %>%
+  inner_join(sentimentSummary, by = c("EST", "TextClean"))
+
+# create a list of the top 15 tags
+top15Tags <- hashtagSentimentJoin %>%
+  count(Hashtags, sort = TRUE) %>%
+  slice_max(n, n = 15) %>%
+  pull(Hashtags)
+
+plotDataHashtagSentiment <- hashtagSentimentJoin %>%
+  # remove hashtags outside of the top 15
+  filter(Hashtags %in% top15Tags)
+```
+
+
+
+
+
+```{r, fig.height=5, fig.width=8}
+# Create a summary table for the mean/median lines and text labels
+statsLabelsHashtagSentiment <- plotDataHashtagSentiment %>%
+  group_by(Hashtags) %>%
+  summarize(
+    mu = mean(SentimentScore, na.rm = TRUE),
+    md = median(SentimentScore, na.rm = TRUE)
+  )
+
+# 2. Loop through each hashtag and generate a plot
+for (current_tag in top15Tags) {
+  
+  # Filter data for just this hashtag
+  tag_data <- hashtagSentimentJoin %>%
+    filter(Hashtags == current_tag)
+  
+  # Calculate stats for this specific tag
+  stats <- tag_data %>%
+    summarize(
+      n = n(),
+      mu = mean(SentimentScore, na.rm = TRUE),
+      md = median(SentimentScore, na.rm = TRUE),
+      min_val = min(SentimentScore, na.rm = TRUE),
+      max_val = max(SentimentScore, na.rm = TRUE)
+    )
+
+  # building out plots
+  p <- ggplot(tag_data, aes(x = SentimentScore)) +
+    geom_density(fill = "lightgoldenrod", color = "black", alpha = 0.7, adjust = 2) +
+    
+    geom_vline(aes(xintercept = stats$mu, color = "Mean"), linetype = "dashed", linewidth = 1) +
+    geom_vline(aes(xintercept = stats$md, color = "Median"), linetype = "dotted", linewidth = 1) +
+    geom_vline(xintercept = 0, color = "black", alpha = 0.3, linewidth = 0.5) +
+    # Styling the Legend & Colors
+    scale_color_manual(name = "Metrics", values = c("Mean" = "red", "Median" = "darkgreen")) +
+    theme_minimal(base_size = 12) +
+    # Center the title and customize the look
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+      plot.subtitle = element_text(hjust = 0.5, size = 11),
+      plot.caption = element_text(hjust = 0.5, size = 10),
+      panel.grid.minor = element_blank(),
+      legend.position = "top"
+    ) +
+    labs(
+      title = paste0("Sentiment Distribution for ", current_tag),
+      subtitle = "Distribution of Sentiment (Smoothed Kernel Density)",
+      x = "Sentiment Score",
+      y = "Density",
+      caption = paste0("Total Observations (n): ", stats$n, "\n",
+                       "Sentiment score - ", 
+                       "Mean: ", round(stats$mu, 2),
+                       " | Median: ", round(stats$md, 2),
+                       " | Min: ", round(stats$min_val, 2), 
+                       " | Max: ", round(stats$max_val, 2))
+    )
+  
+  # Explicitly print the plot in each iteration
+  print(p)
+}
+```
+
