@@ -1,0 +1,1645 @@
+---
+title: "January 6th 'Capitol' Twitter Data Analysis"
+author: "Sage Fuentes"
+date: "2026-05-05"
+output:
+  html_document:
+    df_print: paged
+editor_options:
+  markdown:
+    wrap: 72
+  chunk_output_type: inline
+---
+
+# January 6th Twitter Data Analysis
+
+## Goal
+
+The goal of this analysis will be providing top down statistics and
+visualizations of sentiment for data from Twitter (now called X)
+relating to the events that took place on January 6th, 2021. The work
+here is exemplary and meant to show a wide, but not comprehensive, range
+of techniques and abilities within social media text analysis. The data
+was from an original analysis done in 2021, but as techniques have
+advanced considerably with the advent of better machine learning models
+and LLMs, a new analysis is being conducted.
+
+```{r setup, include=FALSE}
+# global knitr options
+knitr::opts_chunk$set(
+  echo = TRUE,
+  fig.width = 8, 
+  fig.height = 5
+)
+# Load libraries
+library(tidyverse)
+library(arrow) # using parquet for the dataset
+library(lubridate) #required due to original date data being in PST encoded as UTC
+library(tidytext)
+library(textclean)
+library(gt) # for descriptive tables
+library(textdata)
+library(scales)
+library(patchwork)
+
+# Reading data back in
+if (!exists("jan6_capitol_df")){
+  jan6_capitol_df <- arrow::read_parquet("./data/interim/jan6Dataset.parquet")
+}
+if (!exists("tokenized_words")){
+  tokenized_words <-
+    arrow::read_parquet("./data/interim/tokenized_words.parquet")
+}
+if (!exists("vader_data")){
+  vader_data <- 
+    arrow::read_parquet("./data/processed/vader_results_final.parquet")
+}
+if (!exists("roberta_data")){
+  roberta_data <- 
+    arrow::read_parquet("./data/processed/roberta_results_final.parquet")
+}
+```
+
+## Data
+
+The original data set was collected in 2021 and contains all instances
+of the word 'Capitol' from the time period of January 5th, 2021 at 12:00
+AM PST to January 7th, 2021 at 11:59 PM PST. This data set was collected
+between August 18th and 19th 2021 using the `snscrape` Python repo which
+is no longer functioning for collection of Twitter/X data. Academic
+researcher development permissions were obtained from Twitter.
+
+The resulting data from this cleaning and analysis will be provided in
+the repo.
+
+The original data includes the following:
+
+- Date: Datetime collected as UTC but shifted to EST for the main
+  analysis. This is addressed in the below data cleaning.
+
+- Username: Twitter usernames were originally collected, but have been
+  converted to anonymized subject IDs in the resulting data. Some
+  individual tweets from prominent users may still be included directly
+  within discussions.
+
+- Text: The original text of the tweet. This includes artifacts such as
+  HTML entity encoding.
+
+- Outlinks: Any outbound links found in the original tweet.
+
+- ReplyCount: Number of replies to that tweet.
+
+- RetweetCount: Number of retweets of that tweet.
+
+- LikeCount: Number of likes on that tweet.
+
+- QuoteCount: Number of times tweet was quoted.
+
+- ProcessedText: This was an original attempt to process the raw text to
+  remove elements such as HTML entity encoding. However, some forms of
+  processing were not conducted, so text has been cleaned again detailed
+  below.
+
+- TextBlobSubjectivity: TextBlob Subjectivity was included in the
+  original analysis of this data, while some older methods are included
+  in the below work, TextBlob has been omitted from the original data.
+
+- VADER Sentiments: Positive, negative, neutral, and a compound score
+  for VADER were included in the original analysis. VADER analysis was
+  performed again as the method still offers great insights for a
+  lightweight model, however that data has been re-ran via Python as
+  opposed to the original version due to the processing needs of the
+  text.
+
+### Data Cleaning
+
+Outputs from data cleaning will not be rendered in this document to
+conserve space, but comprehensive comments and the full code have been
+preserved for transparency.
+
+```{r load-raw-data, eval=FALSE, echo = TRUE}
+# Get a list of all CSV file paths in the data folder
+files <- list.files(path = "./data/raw", 
+                    pattern = "*.csv", 
+                    full.names = TRUE)
+
+# Read them all into one data frame
+# bind them together into one tibble
+combined_data <- read_csv(files, id = "file_path")
+# taking a glimpse to make sure that all the data types are what they need to be
+# glimpse(combined_data)
+```
+
+As previously mentioned, the time range for the original collected data
+was from the time period of January 5th, 2021 at 12:00 AM UTC to January
+7th, 2021 at 11:59 PM UTC. As the events occured in the EST or
+`America/New_York` timezone they are shifted here for future clarity and
+times after this point are all in EST.
+
+Lastly, the data is filtered between January 5th, 2021 at 12:00 PM and
+January 7th, 2021 at 12:00 PM. This choice was specifically to capture
+the 24 hours before and after Trump's 12 pm speech at the Eclipse in
+Washington D.C., the run up to the event and simultaneous events in
+other states, the entire period of January 6th across the entire United
+States as the event was being reacted to in the Los Angeles timezone
+well into the night and next day, and to capture the time of
+certification of Joe Biden as 46th President of the United State which
+occurred at 3:42 AM on January 7th.
+
+```{r clean-date, eval=FALSE, echo = TRUE}
+
+date_clean_data <- combined_data |> 
+  # Convert to EST, and rename to EST for clarity
+  mutate(
+    EST = Date |> 
+      lubridate::with_tz(tzone = "America/New_York")
+  ) |> 
+  # Filter between noon EST on the 5th and noon EST on the 7th
+  filter(
+    between(
+      EST, 
+      ymd_hms("2021-01-05 12:00:00", tz = "America/New_York"), 
+      ymd_hms("2021-01-07 12:00:00", tz = "America/New_York")
+    )
+  )
+
+```
+
+To preserve anonymity of users, usernames have been converted to subject
+ids and the original `Username` column removed. Again, some individual
+tweets from prominent users may still be included directly within
+discussions.
+
+```{r subject-ids, eval=FALSE, echo = TRUE}
+username_clean_data <- date_clean_data |>
+  # Group by Username to isolate unique individuals
+  group_by(Username) |>
+  
+  # Assign a stable, matching ID, then ungroup
+  mutate(subject_id = paste0("subject_", cur_group_id())) |>
+  ungroup() |>
+  
+  # Remove the original Username column for strict anonymity
+  select(-Username)
+```
+
+The text from the dataset next must be cleaned. Here there will be a
+creation of two vectors of text for different analysis purpose:
+
+- Lexicon-friendly token-isolated vector (`token_text`): Optimized for
+  dictionary lookup lexicons (AFINN, NRC). Text was stripped of URLs,
+  mentions, emojis, and non-alphanumeric punctuation, then normalized to
+  lowercase to ensure perfect string-matching against the sentiment
+  keys.
+- Syntactic context vector (`sentence_text`): Tailored for
+  Transformer-based architectures (RoBERTa) and rule-based semantic
+  engines (VADER). While noise like URLs and user handles were filtered
+  out, the lexical casing, sentence structures, and punctuation syntax
+  were intentionally preserved to capture structural modifiers,
+  emphasis, and linguistic nuance.
+
+Column names from old variables like `Outlinks` and `ReplyCount` have
+been renamed here from BigCamelCase to snake_case, in keeping with
+current style guide practices from tidyverse.
+
+```{r clean-text-and-restructure, eval=FALSE, echo = TRUE}
+clean_subset_data <- username_clean_data |>
+  # Want to keep just the relevant information
+  select(subject_id,
+         Text,
+         EST,
+         # renaming from original BigCamelCase
+         outlinks = Outlinks,
+         reply_count = ReplyCount,
+         retweet_count = RetweetCount,
+         like_count = LikeCount,
+         quote_count = QuoteCount) |> 
+  # want to remove duplicate tweets that are from the same user and time
+  distinct(subject_id, Text, EST, .keep_all = TRUE) |>
+  # Last step, cleaning the text again and making a column of hashtags for individual analysis
+  mutate(
+    # Extract hashtags into a list column
+    hashtags = stringr::str_extract_all(Text, "#\\w+"),
+    # Create a 'clean' version for word-level analysis
+    sentence_text = Text |> 
+      textclean::replace_html(symbol = TRUE) |> # remove HTML Encoding Entities
+      textclean::replace_url() |> # Remove URLs
+      textclean::replace_tag() |> # Remove Mentions
+      stringr::str_squish(), # Standardize spaces
+  
+    token_text = sentence_text |> 
+      stringr::str_replace_all("[^[:alnum:][:space:]]", " ") |> # remove 
+      # non-alphanumerics
+      stringr::str_squish() |>  # Standardize spaces
+      stringr::str_to_lower()) |> 
+  select(-Text)
+
+```
+
+Lastly, the data frame is being saved to a parquet file using `arrow`
+due to the efficiency of the parquet format in handling data of this
+size and due to the need to move this data to Python later in the
+analysis for support with the VADER and RoBERTa analysis.
+
+The resulting data set includes the following variables
+
+- subject_id: Anonymized IDs for users.
+
+- EST: Time in EST. Time range from January 5th, 2021 at 12:00 AM PST to
+  January 7th, 2021 at 11:59 PM PST.
+
+- sentence_text: Text optimized for sentence level analysis such as
+  VADER and RoBERTa. Structure and syntax were preserved to capture
+  modifiers, emphasis, and nuance.
+
+- token_text: Text optimized for token level analysis such as AFINN and
+  NRC. Text was stripped of most features then normalized to lowercase.
+
+- outlinks: Any outbound links found in the original tweet. 
+
+- reply_count: Number of replies to that tweet.
+
+- retweet_count: Number of retweets of that tweet.
+
+- like_count: Number of likes on that tweet.
+
+- quote_count: Number of times tweet was quoted.
+
+- hashtags: Any hashtags present in the original tweet.
+
+Attached media in the form of videos, pictures, or other documents is
+not represented in this data set.
+
+```{r save-main-data, eval=FALSE, echo = TRUE}
+# Data saved here, read back in at setup for ease
+pq_6th_path <- "./data/interim/jan6Dataset.parquet"
+arrow::write_parquet(clean_subset_data, pq_6th_path)
+```
+
+## Analysis
+
+### Descriptive Summary
+
+Now that there is a cleaned data set, the first matter to attend to is a
+top down descriptive summary of the data. The below table includes
+rudimentary descriptives along with some data quality and sparsity
+metrics and one unique subject activity metric defined as follows.
+
+- Zero-Engagement Trajectory Rate: represents the percentage of posts in
+  the data set that received absolutely zero public interactions after
+  being posted to Twitter, defined as tweets where
+
+$$\text{reply_count}=\text{retweet_count}=\text{like_count}=\text{quote_count}=0$$
+
+- Hashtag Sparsity Rate: represents the percentage of posts in the data
+  set that did not include hashtags.
+
+- External URL Inclusion Rate: represents the percentage of posts in the
+  data set that included an external URL.
+
+- Single Tweet Subject Rate: represents the percentage of users that
+  tweeted only once within the data set.
+
+- Top 1% Subject Tweet Share: represents the percentage of all tweets
+  that were posted by the 1% of individuals that posted the most
+
+```{r summary-metrics-build}
+summary_metrics <- jan6_capitol_df |>
+  summarise(
+    # Core descriptives
+    total_records   = n(),
+    unique_subjects = n_distinct(subject_id),
+    
+    # Text Field Dynamics: Character Constraints
+    min_char_length  = min(stringr::str_length(sentence_text),  na.rm = TRUE),
+    max_char_length  = max(stringr::str_length(sentence_text),  na.rm = TRUE),
+    mean_char_length = mean(stringr::str_length(sentence_text), na.rm = TRUE),
+    
+    # Text Field Dynamics: Token/Word Variations
+    min_word_count  = min(
+      stringr::str_count(sentence_text, "\\s+") + 1,
+      na.rm = TRUE
+    ),
+    max_word_count  = max(
+      stringr::str_count(sentence_text, "\\s+") + 1,
+      na.rm = TRUE
+    ),
+    mean_word_count = mean(
+      stringr::str_count(sentence_text, "\\s+") + 1,
+      na.rm = TRUE
+    ),
+    
+    # Peak Engagement Vectors
+    max_replies  = max(reply_count,   na.rm = TRUE),
+    max_retweets = max(retweet_count, na.rm = TRUE),
+    max_likes    = max(like_count,    na.rm = TRUE),
+    max_quotes   = max(quote_count,   na.rm = TRUE),
+    
+    # Central Tendency: Engagement
+    # Mean and median engagement metrics give a more complete picture of
+    # typical tweet performance alongside the peak values above. Max values
+    # alone are easily skewed by viral outliers.
+    mean_replies   = mean(reply_count,     na.rm = TRUE),
+    median_replies = median(reply_count,   na.rm = TRUE),
+    
+    mean_retweets   = mean(retweet_count,   na.rm = TRUE),
+    median_retweets = median(retweet_count, na.rm = TRUE),
+    
+    mean_likes   = mean(like_count,   na.rm = TRUE),
+    median_likes = median(like_count, na.rm = TRUE),
+    
+    mean_quotes   = mean(quote_count,   na.rm = TRUE),
+    median_quotes = median(quote_count, na.rm = TRUE),
+    
+    # Data Quality: Zero-Inflation and Sparsity Rates
+    zero_engagement_rate  = mean(
+      reply_count == 0 &
+        retweet_count == 0 &
+        like_count    == 0 &
+        quote_count   == 0,
+      na.rm = TRUE
+    ) * 100,
+    hashtag_sparsity_rate = mean(lengths(hashtags) == 0, na.rm = TRUE) * 100,
+    outlinks_rate         = mean(
+      !is.na(outlinks) & outlinks != "" & outlinks != "[]",
+      na.rm = TRUE
+    ) * 100
+  )
+
+# Subject-level tweet volume metrics
+# Computed separately because they require a group_by aggregation step
+# before summarising, which cannot be done inline above.
+subject_tweet_counts <- jan6_capitol_df |>
+  count(subject_id, name = "tweet_count")
+
+subject_volume_metrics <- subject_tweet_counts |>
+  summarise(
+    # Most prolific individual subject in the corpus.
+    max_tweets_by_subject = max(tweet_count),
+    
+    # Central tendency of per-subject tweet volume. A large gap between mean
+    # and median indicates a small number of highly active users are driving
+    # corpus volume — an important caveat for aggregate sentiment analysis.
+    mean_tweets_per_subject   = mean(tweet_count),
+    median_tweets_per_subject = median(tweet_count),
+    
+    # Share of subjects who tweeted exactly once. High values suggest the
+    # corpus contains many incidental or low-engagement participants, which
+    # contextualizes the mean/median gap above.
+    single_tweet_subject_pct = mean(tweet_count == 1) * 100,
+    
+    # Share of total tweets produced by the top 1% of subjects
+    # by volume. High values indicate the corpus is dominated by power users,
+    # which should be noted when interpreting any aggregate sentiment results.
+    top_1pct_tweet_share = {
+      threshold <- quantile(tweet_count, 0.99)
+      sum(tweet_count[tweet_count >= threshold]) / sum(tweet_count) * 100
+    }
+  )
+
+# Bind subject-level metrics into the main summary row so the pivot below
+# handles everything in a single pass.
+summary_metrics <- bind_cols(summary_metrics, subject_volume_metrics)
+
+# Format
+formatted_data <- summary_metrics |>
+  tidyr::pivot_longer(
+    cols      = everything(),
+    names_to  = "Metric",
+    values_to = "Value"
+  ) |>
+  mutate(
+    Group = case_when(
+      Metric %in% c("total_records", "unique_subjects") ~
+        "Corpus Volume",
+      stringr::str_detect(Metric, "char_length") ~
+        "Text Dynamics (Chars)",
+      stringr::str_detect(Metric, "word_count") ~
+        "Text Dynamics (Words)",
+      Metric %in% c(
+        "max_replies", "max_retweets", "max_likes", "max_quotes"
+      ) ~
+        "Peak Engagement",
+      stringr::str_detect(
+        Metric,
+        "mean_repl|median_repl|mean_retw|median_retw|mean_like|median_like|mean_quot|median_quot"
+      ) ~
+        "Engagement Central Tendency",
+      stringr::str_detect(
+        Metric,
+        "tweets_by_subject|tweets_per_subject|single_tweet_subject|top_1pct"
+      ) ~
+        "Subject Activity Distribution",
+      TRUE ~
+        "Data Quality & Sparsity Audit"
+    ),
+    Metric = case_when(
+      Metric == "total_records"             ~ "Total Captured Tweets",
+      Metric == "unique_subjects"           ~ "Unique User Identities (Anonymized)",
+      Metric == "min_char_length"           ~ "Minimum Character Boundary",
+      Metric == "max_char_length"           ~ "Maximum Character Boundary",
+      Metric == "mean_char_length"          ~ "Average Structural Character Length",
+      Metric == "min_word_count"            ~ "Minimum Document Word Count",
+      Metric == "max_word_count"            ~ "Maximum Document Word Count",
+      Metric == "mean_word_count"           ~ "Average Document Word Count",
+      Metric == "max_replies"               ~ "Max Replies Received (Single Tweet)",
+      Metric == "max_retweets"              ~ "Max Retweets Received (Single Tweet)",
+      Metric == "max_likes"                 ~ "Max Likes Received (Single Tweet)",
+      Metric == "max_quotes"                ~ "Max Quotes Received (Single Tweet)",
+      Metric == "mean_replies"              ~ "Mean Replies per Tweet",
+      Metric == "median_replies"            ~ "Median Replies per Tweet",
+      Metric == "mean_retweets"             ~ "Mean Retweets per Tweet",
+      Metric == "median_retweets"           ~ "Median Retweets per Tweet",
+      Metric == "mean_likes"                ~ "Mean Likes per Tweet",
+      Metric == "median_likes"              ~ "Median Likes per Tweet",
+      Metric == "mean_quotes"               ~ "Mean Quotes per Tweet",
+      Metric == "median_quotes"             ~ "Median Quotes per Tweet",
+      Metric == "zero_engagement_rate"      ~ "Zero-Engagement Trajectory Rate",
+      Metric == "hashtag_sparsity_rate"     ~ "Hashtag Sparsity Rate",
+      Metric == "outlinks_rate"             ~ "External URL Inclusion Rate",
+      Metric == "max_tweets_by_subject"     ~ "Most Tweets by a Single Subject",
+      Metric == "mean_tweets_per_subject"   ~ "Average Tweets per Subject",
+      Metric == "median_tweets_per_subject" ~ "Median Tweets per Subject",
+      Metric == "single_tweet_subject_pct"  ~ "Single Tweet Subject Rate",
+      Metric == "top_1pct_tweet_share"      ~ "Top 1% Subject Tweet Share"
+    )
+  )
+
+# Save to render
+executive_summary_table <- formatted_data |>
+  group_by(Group) |>
+  gt(rowname_col = "Metric") |>
+  tab_header(
+    title    = md("**January 6 Top Down Descriptive Summary**"),
+    subtitle = "Comprehensive Architecture, String Metadata, and Behavioral Gaps"
+  ) |>
+  # Formatter 1: Raw integers for counts with no decimal component
+  fmt_number(
+    rows     = !stringr::str_detect(Metric, "Average|Mean|Median|Rate|Inclusion|Share"),
+    columns  = Value,
+    decimals = 0
+  ) |>
+  # Formatter 2: One decimal place for averages and central tendency metrics
+  fmt_number(
+    rows     = stringr::str_detect(Metric, "Average|Mean|Median"),
+    columns  = Value,
+    decimals = 1
+  ) |>
+  # Formatter 3: Percentage formatting for rate and share metrics
+  fmt_number(
+    rows     = stringr::str_detect(Metric, "Rate|Inclusion|Share"),
+    columns  = Value,
+    decimals = 1,
+    pattern  = "{x}%"
+  ) |>
+  tab_style(
+    style     = cell_text(color = "grey40", size = px(11)),
+    locations = cells_title(groups = "subtitle")
+  ) |>
+  tab_style(
+    style     = cell_text(size = px(14)),
+    locations = cells_title(groups = "title")
+  ) |>
+  tab_options(
+    row_group.font.weight             = "bold",
+    row_group.background.color        = "grey95",
+    table.border.top.color            = "black",
+    table.border.bottom.color         = "black",
+    column_labels.border.bottom.color = "black",
+    data_row.padding                  = px(5)
+  )
+```
+
+```{r peak-engagement-build}
+# Peak Engagement Tweets
+# For each engagement axis, grab the single tweet that hit the corpus maximum.
+# with_ties = FALSE ensures one row per axis even when multiple tweets share
+# the peak value.
+
+peak_tweets <- bind_rows(
+  jan6_capitol_df |>
+    slice_max(reply_count, n = 1, with_ties = FALSE) |>
+    mutate(engagement_axis = "Max Replies"),
+
+  jan6_capitol_df |>
+    slice_max(retweet_count, n = 1, with_ties = FALSE) |>
+    mutate(engagement_axis = "Max Retweets"),
+
+  jan6_capitol_df |>
+    slice_max(like_count, n = 1, with_ties = FALSE) |>
+    mutate(engagement_axis = "Max Likes"),
+
+  jan6_capitol_df |>
+    slice_max(quote_count, n = 1, with_ties = FALSE) |>
+    mutate(engagement_axis = "Max Quotes")
+  ) |>
+  select(
+    engagement_axis,
+    EST,
+    sentence_text,
+    reply_count,
+    retweet_count,
+    like_count,
+    quote_count
+  )
+
+# Render
+peak_engagement_table <- peak_tweets |>
+  gt(rowname_col = "engagement_axis") |>
+  tab_header(
+    title    = md("**Peak Engagement Tweets**"),
+    subtitle = "The single highest-performing tweet on each engagement axis"
+  ) |>
+  cols_label(
+    EST    = "Timestamp (EST)",
+    sentence_text = "Tweet Text",
+    reply_count   = "Replies",
+    retweet_count = "Retweets",
+    like_count    = "Likes",
+    quote_count   = "Quotes"
+  ) |>
+  # Format timestamp: drop seconds for readability in a summary table
+  fmt_datetime(
+    columns = EST,
+    format  = "MMM d, yyyy HH:mm",
+    tz = "America/New_York"
+  ) |>
+  fmt_number(
+    columns  = c(reply_count, retweet_count, like_count, quote_count),
+    decimals = 0
+  ) |>
+  cols_width(
+    EST    ~ px(140),
+    sentence_text ~ px(360),
+    everything()  ~ px(80)
+  ) |>
+  tab_style(
+    style     = cell_text(style = "italic", color = "grey30"),
+    locations = cells_body(columns = sentence_text)
+  ) |>
+  tab_style(
+    style     = cell_text(size = px(11), color = "grey40"),
+    locations = cells_body(columns = c(EST))
+  ) |>
+  # Bold the axis-defining cell in each row so the peak stat reads at a glance
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_body(
+      columns = reply_count,
+      rows    = engagement_axis == "Max Replies"
+    )
+  ) |>
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_body(
+      columns = retweet_count,
+      rows    = engagement_axis == "Max Retweets"
+    )
+  ) |>
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_body(
+      columns = like_count,
+      rows    = engagement_axis == "Max Likes"
+    )
+  ) |>
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_body(
+      columns = quote_count,
+      rows    = engagement_axis == "Max Quotes"
+    )
+  ) |>
+  tab_style(
+    style     = cell_text(color = "grey40", size = px(11)),
+    locations = cells_title(groups = "subtitle")
+  ) |>
+  tab_style(
+    style     = cell_text(size = px(14)),
+    locations = cells_title(groups = "title")
+  ) |>
+  tab_options(
+    row_group.font.weight             = "bold",
+    table.border.top.color            = "black",
+    table.border.bottom.color         = "black",
+    column_labels.border.bottom.color = "black",
+    data_row.padding                  = px(5)
+  )
+```
+
+```{r summary-metrics-table}
+executive_summary_table
+```
+
+```{r peak-engagement-table}
+peak_engagement_table
+```
+
+#### Assessment of Descriptive Summary
+
+Several key elements are prominent within this descriptive summary
+primarily around volume, subject activity, sparsity, and peak
+engagement.
+
+There are approximately 1.8 times the amount of tweets as there are
+users that tweeted multiple times, with one user tweeting 264 times over
+the course of this time frame. While many users did tweet more than
+once, the majority, 70.5%, of users tweeted only once. Only about 13% of
+all users included hashtags, bringing to question what content was
+contained within hashtags that will be considered below.
+
+The 4 tweets representing the most replies, retweets, likes, and quotes
+within this timeframe have been extracted for viewing. As these are all
+public figures, links to each tweet have been included. Notably, due to
+the time this data was collected and the constantly moving nature of
+Twitter/X, there is some variation in reported numbers for replies, retweets, likes, and quotes in the current live versions
+
+- Max Replies: Ted Cruz, United States Senator for Texas during January
+  6th, 2021. Ted Cruz was present at the Capitol that day.
+  <https://x.com/tedcruz/status/1346906229189341184>
+
+- Max Retweets: John Flowers, American basketball player who was signed
+  with French team Boulazac during January 6th, 2021. Notably, his tweet
+  references the killing of Breonna Taylor, a woman who was wrongfully
+  killed by police officers in her own home, and Ashli Babbitt, a woman
+  who was shot by U.S. Capitol Police while she attempted to enter a
+  barricaded door. <https://x.com/jflow41/status/1349070404321685515>
+
+- Max Likes: Former U.S. President Barack Obama, who issued a statement
+  attached to his tweet on the events at the Capitol. In his statement,
+  he specifically condemns Trump for inciting the violence and
+  encourages Republican leads to take steps away from the excitatory
+  political climate.
+  <https://x.com/BarackObama/status/1346983894298595330>
+
+- Max Quotes: Elijah Schaffer, a right-wing influencer. His tweet
+  includes footage of the event during early stages before protesters
+  entered the Capitol.
+  <https://x.com/ElijahSchaffer/status/1346881968819105792>
+
+### Tweet Volume Timeline
+
+```{r tweet-volume}
+tweet_volume <- jan6_capitol_df |>
+  mutate(
+    time_bin = lubridate::floor_date(EST, unit = "15 minutes")
+  ) |>
+  filter(time_bin >= ymd_hms("2021-01-06 11:00:00", tz = "America/New_York"),
+         time_bin <= ymd_hms("2021-01-07 11:59:59", tz = "America/New_York")) |>
+  summarise(
+    tweet_count = sum(!is.na(sentence_text)),
+    .by         = time_bin
+  ) |>
+  arrange(time_bin) |>
+  mutate(
+    # Percent change in tweet count relative to the previous 30-minute bin.
+    # lag() looks back one bin; the +1 offset on the denominator avoids
+    # division by zero in bins where the prior count was 0.
+    pct_change = (tweet_count - lag(tweet_count)) / 
+      (lag(tweet_count) + 1) * 100,
+    # As there will be an NA for the first row, change that to a zero just to 
+    # reduce warnings in the graph
+    pct_change = tidyr::replace_na(pct_change, 0)
+  )
+
+# Event reference times for geom_text() labels only. linetype and linewidth
+# are intentionally omitted here; those properties are set directly in the
+# geom_vline() calls below to avoid ggplot scaling them as aesthetics,
+# which inflates their rendered thickness.
+events <- tibble(
+  xintercept = ymd_hms(
+    c(
+      "2021-01-07 00:00:00",
+      "2021-01-06 12:00:00",
+      "2021-01-06 13:00:00",
+      "2021-01-06 14:00:00",
+      "2021-01-06 18:00:00",
+      "2021-01-07 03:42:00"
+    ),
+    tz = "America/New_York"
+  ),
+  label = c(
+    "Midnight",
+    "Trump Starts Speech",
+    "1st Wave of Protestors at Capitol",
+    "Protesters Enter the Capitol",
+    "Police Begin Clearing Capitol",
+    "Pence Calls Majority for Biden"
+  )
+)
+
+volume_plot <- ggplot(tweet_volume, aes(x = time_bin, y = tweet_count)) +
+  # Faint midnight marker
+  geom_vline(
+    xintercept = ymd_hms("2021-01-07 00:00:00", tz = "America/New_York"),
+    linetype   = "dashed",
+    linewidth  = 0.4,
+    color      = "grey50"
+  ) +
+  # Thick dashed event lines
+  geom_vline(
+    xintercept = ymd_hms(
+      c(
+        "2021-01-06 12:00:00",
+        "2021-01-06 13:00:00",
+        "2021-01-06 14:00:00",
+        "2021-01-06 18:00:00"
+      ),
+      tz = "America/New_York"
+    ),
+    linetype  = "dashed",
+    linewidth = 0.8,
+    color     = "grey50"
+  ) +
+  # Solid line for Pence
+  geom_vline(
+    xintercept = ymd_hms("2021-01-07 03:42:00", tz = "America/New_York"),
+    linetype   = "solid",
+    linewidth  = 0.8,
+    color      = "grey50"
+  ) +
+  geom_area(fill = "steelblue", alpha = 0.10) +
+  geom_line(linewidth = 0.7, color = "lightskyblue") +
+  
+  geom_text(
+    data        = events,
+    aes(x = xintercept, label = label),
+    y           = Inf,
+    vjust       = 1.4,
+    hjust       = 1.05,
+    angle       = 90,
+    size        = 3.5,
+    color       = "black",
+    inherit.aes = FALSE
+  ) +
+  scale_x_datetime(
+    date_breaks = "2 hours",
+    date_labels = "%H:%M",
+    timezone    = "America/New_York",
+    expand      = expansion(mult = c(0.01, 0.01))
+  ) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title    = "Tweet Volume Timeline — January 6th Capitol Event",
+    subtitle = "From Jan 6 11:00 AM until Jan 7 12:00 PM EST",
+    x        = "Time (EST) - 15-minute interval bins",
+    y        = "Tweet Count",
+    caption  = "Source: Jan 6 'Capitol' Twitter data set"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title       = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle    = element_text(color = "grey40", size = 11, hjust = 0.5),
+    plot.caption     = element_text(color = "grey50", size = 9),
+    panel.grid.minor = element_blank()
+  )
+
+roc_plot <- ggplot(tweet_volume, aes(x = time_bin, y = pct_change)) +
+  # Event reference lines — same as volume plot for visual alignment
+  geom_vline(
+    xintercept = ymd_hms("2021-01-07 00:00:00", tz = "America/New_York"),
+    linetype   = "dashed",
+    linewidth  = 0.4,
+    color      = "grey50"
+  ) +
+  geom_vline(
+    xintercept = ymd_hms(
+      c(
+        "2021-01-06 12:00:00",
+        "2021-01-06 13:00:00",
+        "2021-01-06 14:00:00",
+        "2021-01-06 18:00:00"
+      ),
+      tz = "America/New_York"
+    ),
+    linetype  = "dashed",
+    linewidth = 0.8,
+    color     = "grey50"
+  ) +
+  geom_vline(
+    xintercept = ymd_hms("2021-01-07 03:42:00", tz = "America/New_York"),
+    linetype   = "solid",
+    linewidth  = 0.8,
+    color      = "grey50"
+  ) +
+  geom_hline(yintercept = 0, linewidth = 0.4, color = "grey30") +
+  geom_line(linewidth = 0.6, color = "steelblue") +
+  scale_x_datetime(
+    date_breaks = "2 hours",
+    date_labels = "%H:%M",
+    timezone    = "America/New_York",
+    expand      = expansion(mult = c(0.01, 0.01))
+  ) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    x = NULL,
+    y = "% Change"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.subtitle    = element_text(color = "grey40", size = 11, hjust = 0.5),
+    panel.grid.minor = element_blank()
+  )
+
+patchwork::wrap_plots(
+  volume_plot,
+  roc_plot,
+  ncol    = 1,
+  heights = c(4, 1)
+)
+```
+
+For tweet volume timeline, times were binned to a 15-minute interval
+after experimentation with 10- and 30- minute intervals. 30-minute
+intervals offered little insight into smaller changes within the data
+while 10-minute intervals were much the same as 15-minute interval
+visualizations without distinct peaks in change.
+
+Times before January 6th 11:00 AM were removed due to limited activity
+in comparison to the scope of this data (hundreds of tweets as opposed
+to thousands of them).
+
+#### Assessment of Tweet Volume Timeline
+
+As seen in the graph above, notable events within the timeline of
+January 6 do seem to manifest directly into changes in Twitter activity.
+This is most notable in the sharp increase of tweets after protesters
+entered the Capitol at 2:00 PM. The rate of change and 15-minute
+interval binning manage to accentuate the near instantaneous nature of
+social media and Twitter with peaks in posts culminating only minutes
+after events were unfolding within Washington D.C. While some degree of
+persistent chatter continued throughout the next day and into the next,
+there were no major changes in rate of change even as the Capitol began
+to be cleared and as Pence called the electoral college majority for Joe
+Biden.
+
+### Token-level Sentiment Analysis
+
+Diving into sentiment analysis, this analysis will first start with
+token-level approaches. While many of these are surpassed by more modern
+methods, they can still offer important insights from a corpus of data.
+First steps will be creating the tokenized version of the data set,
+omitting stop words, and generating a list of top 15 words in the data
+set, not including the term 'Capitol' due to the presence of the term in
+each tweet.
+
+```{r token-set-build, eval=FALSE, echo = TRUE}
+# Tokenize
+tokenized_words <- jan6_capitol_df |>
+  collect() |> 
+  # Tokenization
+  tidytext::unnest_tokens(word, token_text, drop = FALSE) |>
+  # Remove stop words
+  anti_join(stop_words, by = "word")
+
+# Saving to conserve time
+arrow::write_parquet(tokenized_words, "./data/interim/tokenized_words.parquet")
+```
+
+```{r top-tokens}
+tweet_word_freq <- tokenized_words |> 
+  count(word, sort = TRUE) |> 
+  slice(2:16)
+
+tweet_word_freq |>
+  ggplot(aes(x = n, y = reorder(word, n))) +
+  
+  # Structural elements: Using a standard corporate palette for accessibility
+  geom_col(fill = "steelblue", width = 0.7) +
+  
+  # Inline value annotation to eliminate axis-tracking cognitive load
+  geom_text(
+    aes(label = scales::comma(n)), 
+    hjust = -0.1, 
+    size = 3.5, 
+    color = "grey20"
+  ) +
+  
+  # Aesthetic bounding: Prevents right-hand coordinate clipping on value strings
+  scale_x_continuous(
+    labels = scales::comma, 
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  
+  # Semantic framework and contextual labeling
+  labs(
+    title = "Top 15 Most Frequent Terms in January 6 Corpus",
+    subtitle = "Term 'Capitol' omitted",
+    x = "Raw Token Count",
+    y = NULL
+  ) +
+  
+  # Minimal typographic layer mapping
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold",
+                              size = 14,
+                              color = "black",
+                              hjust = 0.5),
+    plot.subtitle = element_text(size = 11,
+                                 color = "grey40",
+                                 margin = margin(b = 15),
+                                 hjust = 0.5),
+    panel.grid.major.y = element_blank(), # Suppress redundant horizontal coordinates
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_text(face = "bold", color = "grey10", size = 11),
+    plot.margin = margin(20, 20, 20, 20)
+  )
+```
+
+#### Custom Stop Words
+
+While traditional stop words are already removed from the
+`tokenized_words` data frame, some custom stop words may be necessary
+for certain analysis methods, potentially highlighting a shortcoming or
+obstacle with that method.
+
+- Capitol
+  - Appears in every tweet, sometimes multiple times as evidenced by the
+    above frequency chart.
+- Trump
+  - Holds unrelated sentiment meaning that obscures the AFINN sentiment
+    analysis.
+  - Registers as a 'surprise' word in the NRC analysis.
+- Don
+  - As a shortening of Donald in Donald Trump, registers as a 'trust'
+    word in the NRC analysis.
+- United
+  - As part of "United States" and in individual usage, united is
+    registered in the NRC analysis under multiple categories.
+
+```{r custom-stop-words}
+# anti_join with tokenized_words in instances with 
+custom_stop_words <- tibble(
+  word = c("capitol","trump", "don", "united"
+           ),
+  lexicon = "custom"
+)
+```
+
+#### AFINN Sentiment
+
+The first sentiment analysis used will be the AFINN sentiment analysis
+lexicon. This lexicon assigns individual words within its lexicon scores
+ranging from -5 to +5. AFINN relies on the valence of words to give
+scoring. Sentence level scores can be calculated using sums of all the
+words in the analyzed sentence, a normalized score averaging words
+across a sentence, or normalized scores averaging across a tweet. As
+some tweets are much longer than others, a normalized score is useful
+here for comparisons.
+
+There is no official documentation on how neutrality is handled within
+normalized, composite AFINN scores, so for the purposes of this analysis
+Neutral composite scores have been defined here as normalized scores within the
+range (-0.05, 0.05), similar to how they are handled within VADER.
+
+```{r AFINN}
+# Enforce a consistent factor order for sentiment labels so every plot
+# uses the same left-to-right sequence: negative → neutral → positive.
+sentiment_levels <- c("negative", "neutral", "positive")
+sentiment_colours <- c(
+  "negative" = "firebrick3",
+  "neutral"  = "darkgrey",
+  "positive" = "seagreen4"
+)
+
+# AFINN Sentiment Score per Word
+afinn_sentiment_words <- tokenized_words |>
+  select(EST, token_text, word) |> 
+  # removing custom stop words
+  anti_join(custom_stop_words, by = "word") |> 
+  # Acquire sentiments
+  left_join(tidytext::get_sentiments("afinn"), by = "word")
+
+# Join with sentiments and categorize
+afinn_word_sentiment_cat <- afinn_sentiment_words |>
+  # Filter out words that didn't have an AFINN match
+  filter(!is.na(value)) |>
+  mutate(category = ifelse(value > 0, "Positive", "Negative"))
+
+# Get Top 10 words per category
+afinn_top_words_by_cat <- afinn_word_sentiment_cat |>
+  summarise(n = n(),
+            .by = c(category,
+                    word)
+            ) |>
+  slice_max(n, n = 10, with_ties = FALSE, by = category)
+
+# Comparison Bar Chart
+afinn_token_bar_chart <- ggplot(afinn_top_words_by_cat,
+       aes(x = reorder_within(word, n, category),
+           y = n,
+           fill = category)) +
+  geom_col(show.legend = FALSE, alpha = 0.8) +
+  
+  # Wanted this annotated 
+  geom_text(aes(label = format(n, big.mark = ",")), 
+            hjust = -0.1,            
+            size = 3.5,              
+            fontface = "bold",       
+            color = "gray20") +      
+  
+  # Allow labels to be drawn outside the panel (CRITICAL)
+  coord_flip(clip = "off") + 
+  
+  # facet_wrap set to free due to scale
+  facet_wrap(~category, scales = "free") +
+  scale_x_reordered() + 
+  
+  # Named Colors
+  scale_fill_manual(values = c("Positive" = "seagreen4", "Negative" = "firebrick3")) +
+  
+  # Increase expansion to 30% to accommodate large numbers/outliers
+  scale_y_continuous(expand = expansion(mult = c(0, 0.3))) +
+  
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    plot.subtitle = element_text(hjust = 0.5, size = 11, color = "gray30"),
+    panel.grid.major.y = element_blank(),
+    strip.text = element_text(face = "bold", size = 12),
+    # Increase the right margin of the entire plot as a safety net
+    plot.margin = margin(10, 50, 10, 10) 
+  ) +
+  labs(
+    title = "Top 10 Most Prevalent Sentiment-Bearing Words",
+    subtitle = "Lexical prevalence within the AFINN sentiment dictionary",
+    x = NULL, 
+    y = "Total Frequency of Occurrences"
+  )
+
+# AFINN Sentiment Analysis
+# Average AFINN score per tweet, then bin into sentiment categories using a
+# ±0.05 neutral band. Exact zero is rare when averaging across tokens, so a
+# small buffer prevents artificially inflating the neutral category.
+afinn_sentiment_summary <- afinn_sentiment_words |>
+  filter(!is.na(value)) |>
+  summarise(
+    afinn_sentiment_score = mean(value, na.rm = TRUE),
+    .by = c(EST, token_text)
+  ) |>
+  mutate(
+    afinn_label = case_when(
+      afinn_sentiment_score >  0.05 ~ "positive",
+      afinn_sentiment_score < -0.05 ~ "negative",
+      .default                      = "neutral"
+    ) |>
+      factor(levels = sentiment_levels)
+  )
+
+# Aggregate counts and percentage labels for each sentiment class
+afinn_bar_data <- afinn_sentiment_summary |>
+  count(afinn_label) |>
+  mutate(pct = n / sum(n))
+
+# --- Bar Chart: Sentiment Label Distribution ---
+afinn_bar <- ggplot(
+  afinn_bar_data, aes(x = afinn_label, y = n, fill = afinn_label)
+) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(
+    aes(label = paste0(comma(n), "\n(", percent(pct, accuracy = 0.1), ")")),
+    vjust  = -0.4,
+    size   = 3.5,
+    colour = "grey30"
+  ) +
+  scale_fill_manual(values = sentiment_colours) +
+  scale_y_continuous(
+    labels = comma,
+    expand = expansion(mult = c(0, 0.18))
+  ) +
+  labs(
+    title    = "AFINN Sentiment Label Counts",
+    subtitle = "January 6th 'Capitol' Twitter Dataset — averaged per tweet",
+    x        = paste0("Sentiment Label\nn = ", comma(sum(afinn_bar_data$n))),
+    y        = "Tweet Count"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title         = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle      = element_text(colour = "grey40", hjust = 0.5),
+    panel.grid.major.x = element_blank()
+  )
+
+# Density Plot: Distribution of Continuous Scores
+# Mean reference line is mapped through aes() so it appears in the legend
+afinn_mean <- mean(afinn_sentiment_summary$afinn_sentiment_score)
+
+afinn_density <- ggplot(
+  afinn_sentiment_summary, aes(x = afinn_sentiment_score)
+) +
+  geom_density(fill = "lightgoldenrod", colour = "darkblue", alpha = 0.6) +
+  geom_vline(
+    aes(xintercept = afinn_mean, linetype = "Mean", colour = "Mean"),
+    linewidth = 0.8
+  ) +
+  # Shade the neutral band so the ±0.05 threshold is visually anchored
+  annotate(
+    "rect",
+    xmin = -0.05, xmax = 0.05,
+    ymin = -Inf,  ymax = Inf,
+    fill = "grey80", alpha = 0.4
+  ) +
+  scale_colour_manual(
+    name   = "Summary Statistic",
+    values = c("Mean" = "red")
+  ) +
+  scale_linetype_manual(
+    name   = "Summary Statistic",
+    values = c("Mean" = "dashed")
+  ) +
+  labs(
+    title    = "Density of AFINN Normalized Sentiment Scores",
+    subtitle = "Shaded band indicates ±0.05 neutral threshold",
+    x        = paste0(
+      "Mean Token Score per Tweet\nn = ",
+      comma(nrow(afinn_sentiment_summary))
+    ),
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title           = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle        = element_text(colour = "grey40", hjust = 0.5),
+    legend.position      = c(0.88, 0.88),
+    legend.justification = c("right", "top"),
+    legend.background    = element_rect(
+      fill      = "white",
+      colour    = "grey80",
+      linewidth = 0.3
+    ),
+    legend.margin = margin(4, 6, 4, 6),
+    legend.title  = element_text(face = "bold")
+  )
+```
+
+```{r AFINN-token-bar}
+afinn_token_bar_chart
+```
+
+```{r AFINN-bar}
+afinn_bar
+```
+
+```{r AFINN-density}
+afinn_density
+```
+
+##### Assessment of AFINN
+
+The results of AFINN already provide some telling information regarding
+our top-most tokens and the overall landscape of sentiment within the
+data set. First, some tweets were fully omitted as they did not contain
+any of the words from the AFINN lexicon. We can't simply mark these as
+neutral as they still may contain negative or positive sentiment that is
+just a byproduct of differing language. The top tokens in both the
+negative and positive categories are terms referring to participants in
+the actions on January 6th, 'protesters' as a negative term and
+'supporters' as a positive term. This does not enlighten the
+nature of the overall tweets with these terms, but gives guiding
+posts in how to consider the data qualitatively. Looking at examples
+from the data set, outside of more neutral considerations such as
+recounting events, the use of protester and supporter seemed to be used
+to also make comparisons to other groups, accusations to other groups,
+and condemning the use of supporter or protester in favor of terms like
+terrorist or insurrectionist.
+
+Examples taken from top 200 liked or quoted tweets:
+
+- Holy shit. Matt Gaetz just said, "some of the people who breached the
+  Capitol today were not Trump supporters, they were masquerading as
+  Trump supporters and in fact were members of the violent terrorist
+  group antifa."
+
+- "There is no doubt in my mind that if those were Black Lives Matter
+  protesters yesterday breaking into the Capitol Building, there would
+  be dozens and dozens of people dead today," Former CIA Acting and
+  Deputy Director @MichaelJMorell tells @vladduthiersCBS
+
+- "That's not a protest, that's a terrorist attack. ... Stop using the
+  same word, it's disrespectful. It's ridiculous, and it's shameful to
+  keep calling them protesters." Draymond Green speaks on the pro-Trump
+  mob breaching the Capitol (via @KNBR)
+
+This also points out another limitation of AFINN, due to the lack of
+context that comes with a lexicon approach, it doesn't provide any real
+understanding for negations or modifiers on the overall nature of the
+usage of the word. The density plot and bar chart paint a much more
+comprehensive view with the overall sentiment being negative by
+majority. As this portion will be useful to compare to the VADER and
+RoBERTa later on, due to their improvements in syntactic context, any changes in sentiment directionality should be noted.
+
+Pulling directly from data,'Rioter' is not a word contained within the
+AFINN lexicon, but it did appeared in 39,039 tweets. Additionally, while
+not included enough in the top tokens, the term 'insurrectionist'
+appeared in 10,933 tweets.
+
+### Sentence Level Sentiment Analysis
+
+The token-level approach above, while informative, show a fundamental
+constraint: sentiment is assigned word-by-word without any awareness of
+the surrounding sentence. A negation like "not violent" scores
+positively on AFINN because "violent" carries negative valence and the
+"not" is invisible to the lexicon. The analyses that follow address this
+limitation directly. VADER and RoBERTa both operate on the syntactically
+preserved version of each tweet and are capable of treating the tweet as
+a unit of meaning rather than a bag of scored tokens. This shift in
+analytical unit is consequential for a corpus like this one, where
+rhetorical framing, sarcasm, and conditional language are common.
+
+#### VADER
+
+VADER (Valence Aware Dictionary and sEntiment Reasoner) is a rule-based
+sentiment analysis tool developed by Hutto & Gilbert (2014) and designed
+specifically for social media text. Unlike purely lexicon-driven
+approaches such as AFINN, VADER incorporates a set of grammatical and
+syntactical heuristics that allow it to account for features common in
+informal digital communication such as capitalization for emphasis,
+punctuation intensity (e.g., repeated exclamation marks), degree
+modifiers such as "very" or "kind of", and negation handling. Each tweet
+is scored on a continuous compound scale ranging from -1 (maximally
+negative) to +1 (maximally positive), with the conventional thresholds
+of ≤ -0.05 for negative, ≥ 0.05 for positive, and the band in between
+classified as neutral. Analysis was performed in Python using the
+`vaderSentiment` library on the syntactically preserved `sentence_text`
+field, with results written back to parquet for integration here. VADER
+was not conducted in R due to the library being recently removed from
+CRAN, and while it was possible to install and run an archived version,
+it was substantially slower in R (estimated 3 hours in R versus less
+than a few minutes in Python).
+
+```{r VADER}
+vader_data <- vader_data |> 
+  mutate(vader_label = factor(vader_label, levels = sentiment_levels))
+
+# Compute counts and percentage labels for each sentiment class.
+vader_pct_data <- vader_data |>
+  count(vader_label) |>
+  mutate(
+    pct       = n / sum(n),
+    pct_label = paste0(vader_label, "\n", percent(pct, accuracy = 0.1))
+  )
+
+vader_bar_chart <- ggplot(vader_pct_data,
+                          aes(x = vader_label, y = n, fill = vader_label)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(
+    aes(label = paste0(comma(n), "\n(", percent(pct, accuracy = 0.1), ")")),
+    vjust    = -0.4,
+    size     = 3.5,
+    colour   = "grey30"
+  ) +
+  scale_fill_manual(values = sentiment_colours) +
+  scale_y_continuous(
+    labels = comma,
+    # Increased upper multiplier to 0.18 so count labels above the tallest
+    # bar are never clipped by the plot boundary.
+    expand = expansion(mult = c(0, 0.18))
+  ) +
+  labs(
+    title    = "VADER Sentiment Label Counts",
+    subtitle = "January 6th 'Capitol' Twitter Dataset",
+    x        = paste0("Sentiment Label\nn = ", comma(sum(vader_pct_data$n))),
+    y        = "Tweet Count"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(colour = "grey40", hjust = 0.5),
+    panel.grid.major.x = element_blank()
+  )
+
+# VADER Density plot
+vader_compound_mean   <- mean(vader_data$vader_compound)
+
+vader_density <- ggplot(vader_data, aes(x = vader_compound)) +
+  geom_density(fill = "lightgoldenrod", colour = "darkblue", alpha = 0.6) +
+  geom_vline(
+    aes(xintercept = vader_compound_mean,
+        linetype = "Mean",
+        colour = "Mean"),
+    linewidth = 0.8
+  ) +
+  # Shade the neutral band so the ±0.05 threshold is visually anchored
+  annotate(
+    "rect",
+    xmin = -0.05, xmax = 0.05,
+    ymin = -Inf,  ymax = Inf,
+    fill = "grey80", alpha = 0.4
+  ) +
+  scale_colour_manual(
+    name   = "Summary Statistic",
+    values = c("Mean" = "red")
+  ) +
+  scale_linetype_manual(
+    name   = "Summary Statistic",
+    values = c("Mean" = "dashed")
+  ) +
+  scale_x_continuous(limits = c(-1, 1), breaks = seq(-1, 1, 0.25)) +
+  labs(
+    title    = "Density of VADER Compound Scores",
+    subtitle = "Shaded band indicates ±0.05 neutral threshold",
+    x        = paste0("Compound Score\nn = ", comma(nrow(vader_data))),
+    y        = "Density"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(colour = "grey40", hjust = 0.5),
+    legend.position      = c(0.88, 0.88),
+    legend.justification = c("right", "top"),
+    legend.background    = element_rect(fill = "white", colour = "grey80", linewidth = 0.3),
+    legend.margin        = margin(4, 6, 4, 6),
+    legend.title         = element_text(face = "bold")
+  )
+```
+
+```{r VADER-bar}
+vader_bar_chart
+```
+
+```{r VADER-density}
+vader_density
+```
+
+##### Assessment of VADER
+
+VADER's results offer a meaningfully different picture from AFINN, with a higher proportion of neutral tweets and a modest reduction in negative classification. This is expected as VADER was designed specifically for social media text and accounts for capitalization, punctuation intensity, degree modifiers, and negation, all features that appear frequently in politically charged Twitter discourse. Where AFINN omits any tweet containing no matched lexicon terms, VADER scores the full sentence without coverage gaps, which reduces the selection bias toward more expressive language that affected the AFINN sample. The compound score density reflects this as the distribution is smoother and more continuous, with clear negative skew while the neutral band captures the volume of factual reporting and retweet-driven content that AFINN could not score.
+
+#### RoBERTa
+
+RoBERTa (Robustly Optimized BERT Pretraining Approach) is a transformer-
+based model fine-tuned on the
+`cardiffnlp/twitter-roberta-base-sentiment` checkpoint, which was
+specifically trained on Twitter data. Unlike lexicon- based approaches,
+RoBERTa evaluates the full sentence context of each tweet rather than
+scoring individual tokens in isolation, making it substantially more
+sensitive to negation, sarcasm, and syntactic modifiers. Inference was
+performed in Python via the Hugging Face `transformers` library and
+results were written back to parquet for integration here.
+
+```{r roberta}
+roberta_data <- roberta_data |>
+  mutate(roberta_label = factor(roberta_label, levels = sentiment_levels))
+
+roberta_graph_data <- roberta_data |>
+  count(roberta_label) |>
+  mutate(
+    pct       = n / sum(n),
+    pct_label = paste0(roberta_label, "\n", percent(pct, accuracy = 0.1))
+  )
+
+roberta_bar <- ggplot(roberta_graph_data,
+                      aes(x = roberta_label, y = n, fill = roberta_label)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(
+    aes(label = paste0(comma(n), "\n(", percent(pct, accuracy = 0.1), ")")),
+    vjust  = -0.4,
+    size   = 3.5,
+    colour = "grey30"
+  ) +
+  scale_fill_manual(values = sentiment_colours) +
+  scale_y_continuous(
+    labels = comma,
+    expand = expansion(mult = c(0, 0.18))
+  ) +
+  labs(
+    title    = "RoBERTa Sentiment Label Counts",
+    subtitle = "January 6th 'Capitol' Twitter Dataset",
+    x        = paste0("Sentiment Label\nn = ", comma(sum(roberta_graph_data$n))),
+    y        = "Tweet Count"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title         = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle      = element_text(colour = "grey40", hjust = 0.5),
+    panel.grid.major.x = element_blank()
+  )
+
+# --- Sentiment Volume Over Time ---
+# RoBERTa inference was performed in Python on the full January 6th corpus
+# and written back to parquet, preserving all original fields including EST.
+# This allows direct binning without a join — roberta_data is a complete
+# record of the original dataset with sentiment labels appended.
+roberta_sentiment_volume <- roberta_data |>
+  mutate(
+    time_bin = lubridate::floor_date(EST, unit = "15 minutes")
+  ) |>
+  # Mirror the filter cutoff used in the main volume chart for comparability
+  filter(time_bin >= ymd_hms("2021-01-06 11:00:00", tz = "America/New_York"),
+         time_bin <= ymd_hms("2021-01-07 11:59:59", tz = "America/New_York")) |>
+  summarise(
+    tweet_count = n(),
+    .by         = c(time_bin, roberta_label)
+  ) |>
+  arrange(time_bin) |>
+  # Factor ordering controls stacking sequence and legend order
+  mutate(roberta_label = factor(roberta_label, levels = sentiment_levels))
+
+# Stacked Area Chart: Sentiment Class Volume Over Time
+# Stacked rather than overlapping so total height remains comparable to the
+# main volume chart, while the fill decomposition shows how sentiment class
+# composition shifts across key event windows.
+roberta_timeline <- ggplot(roberta_sentiment_volume,
+       aes(x = time_bin, y = tweet_count, fill = roberta_label)) +
+  # Event reference lines drawn before data layers so they sit behind the fill
+  geom_vline(
+    xintercept = ymd_hms("2021-01-07 00:00:00", tz = "America/New_York"),
+    linetype   = "dashed",
+    linewidth  = 0.4,
+    color      = "grey50"
+  ) +
+  geom_vline(
+    xintercept = ymd_hms(
+      c(
+        "2021-01-06 12:00:00",
+        "2021-01-06 13:00:00",
+        "2021-01-06 14:00:00",
+        "2021-01-06 18:00:00"
+      ),
+      tz = "America/New_York"
+    ),
+    linetype  = "dashed",
+    linewidth = 0.8,
+    color     = "grey50"
+  ) +
+  geom_vline(
+    xintercept = ymd_hms("2021-01-07 03:42:00", tz = "America/New_York"),
+    linetype   = "solid",
+    linewidth  = 0.8,
+    color      = "grey50"
+  ) +
+  geom_area(alpha = 0.8, position = "stack") +
+  scale_fill_manual(
+    name   = "Sentiment",
+    values = sentiment_colours
+  ) +
+  # Event labels pinned to top of panel
+  geom_text(
+    data        = events,
+    aes(x = xintercept, label = label),
+    y           = Inf,
+    vjust       = 1.4,
+    hjust       = 1.05,
+    angle       = 90,
+    size        = 3,
+    color       = "black",
+    inherit.aes = FALSE
+  ) +
+  scale_x_datetime(
+    date_breaks = "2 hours",
+    date_labels = "%H:%M",
+    timezone    = "America/New_York",
+    expand      = expansion(mult = c(0.01, 0.01))
+  ) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title    = "Tweet Sentiment Volume Over Time — January 6th Capitol Event",
+    subtitle = "15-minute interval bins by RoBERTa sentiment class, Eastern Time",
+    x        = "Time (EST)",
+    y        = "Tweet Count",
+    caption  = "Source: Jan 6 'Capitol' Twitter data"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title      = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle   = element_text(color = "grey40", size = 11, hjust = 0.5),
+    plot.caption    = element_text(color = "grey50", size = 9),
+    panel.grid.minor = element_blank(),
+    # Bottom legend keeps the top panel clear for the event line labels
+    legend.position = "bottom"
+  )
+```
+
+```{r roberta-bar}
+roberta_bar
+```
+
+```{r roberta-timeline}
+roberta_timeline
+```
+
+RoBERTa's label distribution reinforces the consensus established by
+AFINN and VADER, negative sentiment was the dominant force across the
+January 6th corpus. However, the proportions differ in ways that reflect
+the model's architectural advantages. As a transformer fine-tuned on
+approximately 124 million tweets, RoBERTa evaluates full sentence
+context rather than isolated tokens, making it substantially more
+sensitive to negation, sarcasm, and syntactic modifiers that
+lexicon-based methods systematically misclassify. The sentiment timeline
+makes the most compelling case for this contextual sensitivity, negative
+sentiment was not merely dominant in aggregate but remained the dominant
+class throughout the entire event window.
+
+A persistent limitation across all three methods is that the
+positionality and directionality of negativity, who negativity is
+directed at and from what ideological position, cannot be inferred
+without additional modeling. Topic modeling (LDA) or Named Entity
+Recognition (NER) would be natural extensions and may be addressed in a
+follow-up analysis.
+
+## Appendix A: NRC Emotions
+
+While originally visualized, NRC analysis was not included in the main
+analysis due to difference in design and output not being comparable to
+more robust methods. Inclusion here has been provided for viewing.
+
+```{r nrc}
+nrc_emotions <- tokenized_words |>
+  # removing custom stop words
+  anti_join(custom_stop_words, by = "word") |> 
+  # Joining NRC sentiments
+  inner_join(tidytext::get_sentiments("nrc"), 
+             by = "word", 
+             relationship = "many-to-many") |>
+  count(word, sentiment, sort = TRUE)
+
+# Visualizing emotion distribution
+# Get the list of unique emotions
+emotion_list <- unique(nrc_emotions$sentiment)
+
+# Manually ordered for logical reading sequence: valence first, then emotions
+emotion_order <- c(
+  "positive", "negative",
+  "trust", "fear", "anger",
+  "sadness", "joy", "disgust",
+  "anticipation", "surprise"
+)
+
+# Loop through and print each plot
+for (emo in emotion_order) {
+  
+  # Filter data for the specific emotion
+  plot_nrc_emotions <- nrc_emotions |>
+    filter(sentiment == emo) |>
+    # Limit to top 10
+    slice_max(n, n = 10)
+  
+  # Create the plot
+  p <- ggplot(plot_nrc_emotions, aes(x = n, y = reorder(word, n))) +
+    # Draw the bars
+    geom_col(aes(fill = n), show.legend = FALSE) + 
+    geom_text(aes(label = scales::comma(n)), 
+              hjust = -0.1,          # Moves text slightly to the right of the bar
+              size = 4,              # Adjust text size
+              fontface = "bold") +
+    # Added a subtle gradient fill
+    scale_fill_viridis_c(option = "mako", begin = 0.3, end = 0.8) +
+    # Expand x-axis so the labels don't get cut off
+    scale_x_continuous(expand = expansion(mult = c(0, .15)), labels = comma) +
+    theme_minimal(base_size = 14) +
+    labs(
+      title = paste("Top Words Expressing:", stringr::str_to_title(emo)),
+      subtitle = paste("Top 10 words associated with", emo, "sentiment"),
+      x = "Total Occurrences",
+      y = NULL
+    ) +
+    theme(
+      # Centering the title and subtitle
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 18),
+      plot.subtitle = element_text(hjust = 0.5, size = 12, color = "gray30"),
+      panel.grid.major.y = element_blank(),
+      axis.text.y = element_text(face = "bold")
+    )
+
+  # In Rmd loops, you must explicitly print the plot
+  print(p)
+}
+```
+
+## References
+
+BBC News. (2023, August 2). *Capitol riots timeline: What happened on 6
+January 2021?* BBC. <https://www.bbc.com/news/world-us-canada-56004916>
+
+Hutto, C. J., & Gilbert, E. (2014). VADER: A parsimonious rule-based
+model for sentiment analysis of social media text. *Proceedings of the
+Eighth International AAAI Conference on Weblogs and Social Media
+(ICWSM-14).* <https://ojs.aaai.org/index.php/ICWSM/article/view/14550>
+
+JustAnotherArchivist. (n.d.). *snscrape: A social networking service
+scraper in Python* [Software]. GitHub.
+<https://github.com/JustAnotherArchivist/snscrape>
+
+Lonsdorf, K. (2022, January 5). *A timeline of how the Jan. 6 attack
+unfolded, including who said what and when.* NPR.
+<https://www.npr.org/2022/01/05/1069977469/a-timeline-of-how-the-jan-6-attack-unfolded-including-who-said-what-and-when>
+
+Liu, Y., Ott, M., Goyal, N., Du, J., Joshi, M., Chen, D., Levy, O.,
+Lewis, M., Zettlemoyer, L., & Stoyanov, V. (2019). *RoBERTa: A robustly
+optimized BERT pretraining approach.* arXiv.
+<https://arxiv.org/abs/1907.11692>
+
+Nielsen, F. Å. (2011). A new ANEW: Evaluation of a word list for
+sentiment analysis in microblogs. In M. Rowe, M. Stankovic, A.-S.
+Dadzie, & M. Hardey (Eds.), *Proceedings of the ESWC2011 Workshop on
+Making Sense of Microposts* (Vol. 718, pp. 93–98).
+<http://ceur-ws.org/Vol-718/paper_16.pdf>
+
+Mohammad, S. M., & Turney, P. D. (2013). Crowdsourcing a word-emotion
+association lexicon. *Computational Intelligence, 29*(3), 436–465.
+<https://doi.org/10.1111/j.1467-8640.2012.00460.x>
+
+Warriner, A. B., Kuperman, V., & Brysbaert, M. (2013). Norms of valence,
+arousal, and dominance for 13,915 English lemmas. *Behavior Research
+Methods, 45,* 1191–1207. <https://doi.org/10.3758/s13428-013-0403-5>

@@ -1,0 +1,30 @@
+library/
+local/
+cellar/
+lock/
+python/
+sandbox/
+staging/
+# Raw data — not anonymized, not for distribution
+data/raw/
+
+# Parquet files handled separately via Zenodo/OSF
+data/interim/*.parquet
+data/processed/*.parquet
+
+# R session artifacts
+.Rhistory
+.RData
+.Rproj.user/
+
+# knitr cache
+*_cache/
+*_files/
+
+# OS clutter
+.DS_Store
+Thumbs.db
+
+# renv package cache — large and machine-specific
+renv/library/
+renv/staging/
