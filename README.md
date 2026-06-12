@@ -4,7 +4,7 @@ A social media text analysis of Twitter data related to the January 6th,
 2021 Capitol event, including longitudinal tweet volume analysis, AFINN,
 VADER, and RoBERTa sentiment analysis.
 
-**Live analysis:** [View here](https://sagefuentes.github.io/jan-6-twitter-data/)
+**Live analysis:** [View here](https://sagefuentes.github.io/Jan-6-Twitter-Data/)
 
 ## Data
 Raw data is not included in this repository. The analysis pipeline reads
