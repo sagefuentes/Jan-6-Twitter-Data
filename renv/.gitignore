@@ -8,7 +8,7 @@ staging/
 # Raw data — not anonymized, not for distribution
 data/raw/
 
-# Parquet files handled separately via Zenodo/OSF
+# Parquet files to be hosted separately at future time
 data/interim/*.parquet
 data/processed/*.parquet
 
