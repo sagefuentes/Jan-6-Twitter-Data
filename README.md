@@ -5,7 +5,7 @@
 ![RoBERTa](https://img.shields.io/badge/Model-RoBERTa-orange?style=flat)
 ![License](https://img.shields.io/badge/License-Academic-lightgrey?style=flat)
 
-A longitudinal social media text analysis of Twitter data related to the January 6th, 2021 Capitol events. The analysis covers tweet volume trends, multi-lexicon sentiment analysis (AFINN, NRC, VADER), and transformer-based sentiment classification via RoBERTa, spanning a 48-hour window centred on the events of January 6th.
+A longitudinal social media text analysis of Twitter data related to the January 6th, 2021 Capitol events. The analysis covers tweet volume trends, multi-lexicon sentiment analysis (AFINN, NRC), syntactical (VADER), and transformer-based sentiment classification via RoBERTa, spanning a 48-hour window centred on the events of January 6th.
 
 **Live analysis:** [View here](https://sagefuentes.github.io/Jan-6-Twitter-Data/)
 
